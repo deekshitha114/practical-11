@@ -1,0 +1,176 @@
+# =============================================================================
+# .github/workflows/ci-cd.yml
+# Student Result Prediction API — CI/CD Pipeline  (Practical-9 / 11)
+# =============================================================================
+# Trigger: push or pull-request to main / practical-11-logging branch.
+#
+# Jobs:
+#   1. test   — Install deps, train model, run pytest smoke tests.
+#   2. build  — Build Docker image, run container health check.
+#   3. publish — Login to GHCR and push the image (main branch only).
+#
+# Required secrets (set in GitHub repository → Settings → Secrets):
+#   GHCR_TOKEN   — GitHub Personal Access Token with write:packages scope.
+#                  (Or use the automatically provisioned GITHUB_TOKEN.)
+# =============================================================================
+
+name: CI/CD — Student Result Prediction
+
+on:
+  push:
+    branches: [ main, practical-11-logging ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY:    ghcr.io
+  IMAGE_NAME:  ${{ github.repository_owner }}/student-result-prediction
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Unit / smoke tests
+  # ---------------------------------------------------------------------------
+  test:
+    name: Run Pytest Smoke Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Train model (required before tests)
+        run: python train_model.py
+
+      - name: Run smoke tests
+        run: pytest test_app.py -v --tb=short
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Docker build + container health check
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build and Health-Check Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag student-result-prediction:ci \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            .
+
+      - name: Start container
+        run: |
+          docker run --detach \
+            --name srp-ci-container \
+            --publish 8000:8000 \
+            student-result-prediction:ci
+          echo "Waiting for service to become ready..."
+          sleep 20
+
+      - name: Health-check /health endpoint
+        run: |
+          STATUS=$(curl --silent --output /dev/null \
+                        --write-out "%{http_code}" \
+                        --max-time 10 \
+                        http://localhost:8000/health)
+          echo "Health check HTTP status: $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "ERROR: Health check failed (status=$STATUS)"
+            docker logs srp-ci-container
+            exit 1
+          fi
+
+      - name: Test valid predict request
+        run: |
+          PAYLOAD='{"attendance":85,"study_hours":5,"previous_scores":78,"assignments":9,"extracurricular":1}'
+          STATUS=$(curl --silent --output /dev/null \
+                        --write-out "%{http_code}" \
+                        --max-time 10 \
+                        -X POST http://localhost:8000/predict \
+                        -H "Content-Type: application/json" \
+                        -d "$PAYLOAD")
+          echo "Predict HTTP status: $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "ERROR: Predict endpoint failed (status=$STATUS)"
+            docker logs srp-ci-container
+            exit 1
+          fi
+
+      - name: Verify 422 for invalid request
+        run: |
+          PAYLOAD='{"attendance":"not-a-number","study_hours":5,"previous_scores":78,"assignments":9,"extracurricular":1}'
+          STATUS=$(curl --silent --output /dev/null \
+                        --write-out "%{http_code}" \
+                        --max-time 10 \
+                        -X POST http://localhost:8000/predict \
+                        -H "Content-Type: application/json" \
+                        -d "$PAYLOAD")
+          echo "Invalid request HTTP status: $STATUS"
+          if [ "$STATUS" != "422" ]; then
+            echo "ERROR: Expected 422, got $STATUS"
+            exit 1
+          fi
+
+      - name: Print container logs
+        if: always()
+        run: docker logs srp-ci-container
+
+      - name: Stop and remove container
+        if: always()
+        run: docker rm -f srp-ci-container || true
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Publish image to GHCR  (main branch only)
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish to GHCR
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata (tags and labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-,format=short
+            type=raw,value=practical-11
+
+      - name: Build and push image to GHCR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
